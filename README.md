@@ -1,5 +1,8 @@
 # Bulirsch-Stoer Method in Rust
 
+[![Crates.io](https://img.shields.io/crates/v/bulirsch.svg)](https://crates.io/crates/bulirsch)
+[![Docs](https://docs.rs/bulirsch/badge.svg)](https://docs.rs/bulirsch)
+
 This crate contains a simple implementation of the Bulirsch-Stoer method for solving ordinary
 differential equations.
 
