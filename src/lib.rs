@@ -1,48 +1,61 @@
-//! Implementation of the Bulirsch-Stoer method for solving ordinary differential equations
+//! Implementation of the Bulirsch-Stoer method for solving ordinary differential equations.
 //!
-//! This crate may be useful in situations where an ODE is being integrated step by step with a
-//! prescribed step size that is not too large relative to the dynamical timescale, for example in
-//! cyber-physical system simulations with a fixed control cycle period. Each integration step is
-//! stateless, aside from the integration vector which the caller must maintain.
+//! The [(Gragg-)Bulirsch-Stoer](https://en.wikipedia.org/wiki/Bulirsch%E2%80%93Stoer_algorithm)
+//! algorithm combines the midpoint method with Richardson extrapolation to accelerate convergence.
+//! It is an explicit method that does not require Jacobians.
+//!
+//! This crate's implementation, which follows ch. 17.3.2 of Numerical Recipes (Third Edition), does
+//! not contain adaptive step size routines. It can be useful in situations where an ODE is being
+//! integrated step by step with a prescribed step size that is not too large relative to the
+//! dynamical timescale, for example in simulations of electromechanical control systems with a
+//! fixed control cycle period. Each integration step is stateless, aside from the integration state
+//! vector which the caller must maintain.
 //!
 //! As an example, consider a simple exponential system:
 //!
 //! ```
-//! use ndarray as nd;
-//!
+//! // Define ODE.
 //! struct ExpSystem {}
 //!
 //! impl bulirsch::System for ExpSystem {
 //!     type Float = f64;
 //!
-//!     fn system<
-//!         S: nd::RawDataMut<Elem = Self::Float> + nd::Data + nd::DataMut,
-//!     >(
+//!     fn system(
 //!         &self,
-//!         y: nd::ArrayView1<Self::Float>,
-//!         mut dydt: nd::ArrayBase<S, nd::Ix1>,
+//!         y: bulirsch::ArrayView1<Self::Float>,
+//!         mut dydt: bulirsch::ArrayViewMut1<Self::Float>,
 //!     ) {
 //!         dydt.assign(&y);
 //!     }
 //! }
 //!
 //! let system = ExpSystem {};
+//!
+//! // Set up integrator with tolerance parameters.
 //! let integrator = bulirsch::Integrator::<ExpSystem>::default()
 //!     .with_abs_tol(1e-4)
-//!     .with_rel_tol(1e-4);
+//!     .with_rel_tol(1e-4)
+//!     .with_max_iterations(10);
 //!
+//! // Define initial conditions and provide solution storage.
 //! let t_final = 0.2;
-//! let y = nd::array![1.];
-//! let mut y_final = nd::Array::zeros([1]);
+//! let y = ndarray::array![1.];
+//! let mut y_final = ndarray::Array::zeros([1]);
+//!
+//! // Integrate.
 //! let stats = integrator
 //!     .step(&system, t_final, y.view(), y_final.view_mut())
 //!     .unwrap();
+//!
+//! // Ensure result matches analytic solution.
 //! approx::assert_relative_eq!(
 //!     t_final.exp(),
 //!     y_final[[0]],
 //!     epsilon = 1e-4,
 //!     max_relative = 1e-4,
 //! );
+//!
+//! // Check integration performance.
 //! assert_eq!(stats.num_system_evals, 7);
 //! assert_eq!(stats.num_iterations, 1);
 //! assert_eq!(stats.num_midpoint_substeps, 4);
@@ -52,7 +65,7 @@
 //!
 //! Note that only a handful of system evaluations have been used. By contrast, the `ode_solvers`
 //! crate uses several times more system evaluations for the same small timestep, in part because
-//! the adaptive timestep routines need to be initialized:
+//! its adaptive timestep routines need to be initialized:
 //!
 //! ```
 //! struct ExpSystem {}
@@ -82,8 +95,6 @@
 //! let stats = solver.integrate().unwrap();
 //! assert_eq!(stats.num_eval, 33);
 //! ```
-//!
-//! The implementation follows ch. 17.3.2 of Numerical Recipes (Third Edition).
 
 #![expect(
     non_snake_case,
@@ -106,52 +117,50 @@ impl Float for f64 {}
 pub trait System {
     type Float: Float;
 
-    fn system<
-        Storage: nd::RawDataMut<Elem = Self::Float> + nd::Data + nd::DataMut,
-    >(
+    fn system(
         &self,
-        y: nd::ArrayView1<Self::Float>,
-        dydt: nd::ArrayBase<Storage, nd::Ix1>,
+        y: ArrayView1<Self::Float>,
+        dydt: ArrayViewMut1<Self::Float>,
     );
 }
 
-/// Statistics from taking an integration step
+/// Statistics from taking an integration step.
 #[must_use]
 #[derive(Debug)]
 pub struct Stats<F: Float> {
-    /// The total number of ODE system evaluations used to achieve convergence
+    /// The total number of ODE system evaluations used to achieve convergence.
     pub num_system_evals: usize,
 
-    /// The number of iterations used when convergence was achieved
+    /// The number of iterations used when convergence was achieved.
     pub num_iterations: usize,
-    /// The number of midpoint substeps used when convergence was achieved
+    /// The number of midpoint substeps used when convergence was achieved.
     pub num_midpoint_substeps: usize,
 
-    /// The substep size when convergence was achieved
+    /// The substep size when convergence was achieved.
     pub midpoint_substep_size: F,
 
-    /// The scaled (including absolute and relative tolerances) truncation error
+    /// The scaled (including absolute and relative tolerances) truncation error.
     ///
     /// Will be <= 1 if convergence was achieved, and > 1 if convergence was not achieved.
     pub scaled_truncation_error: F,
 }
 
-/// The integration step failed to converge
+/// Error produced when the integration step failed to converge.
 #[must_use]
 #[derive(Debug)]
 pub struct FailedToConverge<F: Float> {
-    /// Statistics from the failed step
+    /// Statistics from the failed step.
     pub stats: Stats<F>,
 }
 
 /// An explicit ODE integrator using the Bulirsch-Stoer algorithm.
 pub struct Integrator<S: System> {
-    /// The absolute tolerance
+    /// The absolute tolerance.
     abs_tol: S::Float,
-    /// The relative tolerance
+    /// The relative tolerance.
     rel_tol: S::Float,
 
-    /// The maximum number of iterations to use
+    /// The maximum number of iterations to use.
     max_iterations: usize,
 }
 
@@ -172,16 +181,16 @@ impl<S: System> Integrator<S>
 where
     S::Float: Float + nd::ScalarOperand,
 {
-    /// Set the absolute tolerance
+    /// Set the absolute tolerance.
     pub fn with_abs_tol(self, abs_tol: S::Float) -> Self {
         Self { abs_tol, ..self }
     }
-    /// Set the relative tolerance
+    /// Set the relative tolerance.
     pub fn with_rel_tol(self, rel_tol: S::Float) -> Self {
         Self { rel_tol, ..self }
     }
 
-    /// Set the maximum number of iterations per step
+    /// Set the maximum allowed number of iterations per step.
     pub fn with_max_iterations(self, max_iterations: usize) -> Self {
         Self {
             max_iterations,
@@ -189,22 +198,116 @@ where
         }
     }
 
-    /// Take a step using the Bulirsch-Stoer method
+    /// Take a step using the Bulirsch-Stoer method.
     ///
     /// # Arguments
     ///
     /// * `system`: The ODE system.
     /// * `delta_t`: The step size to take.
-    /// * `y_init`: The initial state vector at the start of the step. Note that if
+    /// * `y_init`: The initial state vector at the start of the step.
     /// * `y_final`: The vector into which to store the final computed state at the end of the step.
-    ///
-    /// Note that if you're using e.g. `nalgebra`, you can bridge to `ndarray` vectors using slices.
-    /// See the `test_trig` test.
     ///
     /// # Result
     ///
     /// Stats providing information about integration performance, or an error if integration
     /// failed.
+    ///
+    /// # Examples
+    ///
+    /// Note that if you're using e.g. [`nalgebra`] to define your ODE, you can bridge to
+    /// [`ndarray`] vectors using slices, as long as you're using [`nalgebra`]'s dynamically sized
+    /// vectors. The same applies to using [`Vec`]s, etc. For example, consider a simple
+    /// trigonometric system defined using [`nalgebra`]:
+    ///
+    /// ```
+    /// // Define trigonometric ODE.
+    /// #[derive(Clone, Copy)]
+    /// struct TrigSystem {
+    ///     omega: f32,
+    /// }
+    ///
+    /// fn compute_dydt(
+    ///     omega: f32,
+    ///     y: nalgebra::DVectorView<f32>,
+    ///     mut dydt: nalgebra::DVectorViewMut<f32>,
+    /// ) {
+    ///     dydt[0] = y[1];
+    ///     dydt[1] = -omega.powi(2) * y[0];
+    /// }
+    ///
+    /// impl bulirsch::System for TrigSystem {
+    ///     type Float = f32;
+    ///
+    ///     fn system(
+    ///         &self,
+    ///         y: bulirsch::ArrayView1<Self::Float>,
+    ///         mut dydt: bulirsch::ArrayViewMut1<Self::Float>,
+    ///     ) {
+    ///         let y_nalgebra = nalgebra::DVectorView::from_slice(
+    ///             y.as_slice().unwrap(),
+    ///             y.len(),
+    ///         );
+    ///         let dydt_nalgebra = nalgebra::DVectorViewMut::from_slice(
+    ///             dydt.as_slice_mut().unwrap(),
+    ///             y.len(),
+    ///         );
+    ///         compute_dydt(self.omega, y_nalgebra, dydt_nalgebra);
+    ///     }
+    /// }
+    ///
+    /// // Instantiate system and integrator.
+    /// let system = TrigSystem { omega: 1.2 };
+    /// let integrator =
+    ///     bulirsch::Integrator::default().with_abs_tol(1e-6).with_rel_tol(0.);
+    ///
+    /// // Define initial conditions and integrate.
+    /// let y = ndarray::array![1., 0.];
+    /// let mut y_next = ndarray::Array1::zeros(y.raw_dim());
+    /// let t_final = 1.1;
+    /// let stats = integrator
+    ///     .step(&system, t_final, y.view(), y_next.view_mut())
+    ///     .unwrap();
+    ///
+    /// // Check against analytic solution.
+    /// let (sin, cos) = (t_final * system.omega).sin_cos();
+    /// approx::assert_relative_eq!(y_next[0], cos, epsilon = 1e-2);
+    /// approx::assert_relative_eq!(
+    ///     y_next[1],
+    ///     -system.omega * sin,
+    ///     epsilon = 1e-2
+    /// );
+    ///
+    /// // Check integrator performance.
+    /// assert_eq!(stats.num_system_evals, 31);
+    ///
+    /// // Check against `ode_solvers`.
+    /// impl ode_solvers::System<f32, ode_solvers::SVector<f32, 2>> for TrigSystem {
+    ///     fn system(
+    ///         &self,
+    ///         _x: f32,
+    ///         y: &ode_solvers::SVector<f32, 2>,
+    ///         dy: &mut ode_solvers::SVector<f32, 2>,
+    ///     ) {
+    ///         <Self as bulirsch::System>::system(
+    ///             self,
+    ///             bulirsch::ArrayView1::from_shape([2], y.as_slice()).unwrap(),
+    ///             bulirsch::ArrayViewMut1::from_shape([2], dy.as_mut_slice()).unwrap(),
+    ///         );
+    ///     }
+    /// }
+    ///
+    /// let mut solver = ode_solvers::Dop853::new(
+    ///     system,
+    ///     0.,
+    ///     t_final,
+    ///     t_final,
+    ///     ode_solvers::Vector2::new(1., 0.),
+    ///     0.,
+    ///     1e-6,
+    /// );
+    /// let ode_solvers_stats = solver.integrate().unwrap();
+    /// assert_eq!(ode_solvers_stats.num_eval, 63);
+    /// ```
     pub fn step(
         &self,
         system: &S,
@@ -273,6 +376,7 @@ where
             T.push(Tk);
         }
 
+        // Failed to converge. Compute stats and return.
         let last_two = T.last().unwrap().last_chunk::<2>().unwrap();
         let scaled_truncation_error = compute_scaled_truncation_error(
             last_two[0].view(),
@@ -349,89 +453,12 @@ struct EvaluationCounter<'a, S: System> {
 }
 
 impl<'a, S: System> EvaluationCounter<'a, S> {
-    fn system<
-        Storage: nd::RawDataMut<Elem = S::Float> + nd::Data + nd::DataMut,
-    >(
+    fn system(
         &mut self,
         y: nd::ArrayView1<S::Float>,
-        dydt: nd::ArrayBase<Storage, nd::Ix1>,
+        dydt: nd::ArrayViewMut1<S::Float>,
     ) {
         self.num_system_evals += 1;
         <S as System>::system(&self.system, y, dydt);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_trig() {
-        let system = TrigSystem { omega: 1.2 };
-        let integrator =
-            Integrator::default().with_abs_tol(1e-6).with_rel_tol(0.);
-
-        let y = nd::array![1., 0.];
-        let mut y_next = nd::Array1::zeros(y.raw_dim());
-        let t_final = 1.4;
-        let stats = integrator
-            .step(&system, t_final, y.view(), y_next.view_mut())
-            .unwrap();
-
-        let (sin, cos) = (t_final * system.omega).sin_cos();
-        approx::assert_relative_eq!(y_next[0], cos, epsilon = 1e-2);
-        approx::assert_relative_eq!(
-            y_next[1],
-            -system.omega * sin,
-            epsilon = 1e-2
-        );
-
-        assert_eq!(stats.num_system_evals, 43);
-
-        let mut solver = ode_solvers::Dop853::new(
-            system,
-            0.,
-            t_final,
-            t_final,
-            ode_solvers::Vector2::new(1., 0.),
-            0.,
-            1e-6,
-        );
-        let ode_solvers_stats = solver.integrate().unwrap();
-        assert_eq!(ode_solvers_stats.num_eval, 63);
-    }
-
-    struct TrigSystem {
-        omega: f32,
-    }
-
-    impl System for TrigSystem {
-        type Float = f32;
-
-        fn system<
-            S: nd::RawDataMut<Elem = Self::Float> + nd::Data + nd::DataMut,
-        >(
-            &self,
-            y: nd::ArrayView1<Self::Float>,
-            mut dydt: nd::ArrayBase<S, nd::Ix1>,
-        ) {
-            dydt[[0]] = y[[1]];
-            dydt[[1]] = -self.omega.powi(2) * y[[0]];
-        }
-    }
-
-    impl ode_solvers::System<f32, ode_solvers::SVector<f32, 2>> for TrigSystem {
-        fn system(
-            &self,
-            _x: f32,
-            y: &ode_solvers::SVector<f32, 2>,
-            dy: &mut ode_solvers::SVector<f32, 2>,
-        ) {
-            <Self as System>::system(
-                self,
-                nd::ArrayView1::from_shape([2], y.as_slice()).unwrap(),
-                nd::ArrayViewMut1::from_shape([2], dy.as_mut_slice()).unwrap(),
-            );
-        }
     }
 }
