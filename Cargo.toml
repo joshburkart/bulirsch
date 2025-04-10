@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["Josh Burkart"]
 edition = "2024"
 license = "MIT"
+description = "Bulirsch-Stoer ODE integration method"
 
 [dependencies]
 ndarray = { version = "0.16.1" }
