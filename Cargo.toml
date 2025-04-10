@@ -5,6 +5,7 @@ authors = ["Josh Burkart"]
 edition = "2024"
 license = "MIT"
 description = "Bulirsch-Stoer ODE integration method"
+repository = "https://github.com/joshburkart/bulirsch"
 
 [dependencies]
 ndarray = { version = "0.16" }
