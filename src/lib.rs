@@ -35,10 +35,11 @@
 //! let integrator = bulirsch::Integrator::<ExpSystem>::default()
 //!     .with_abs_tol(1e-4)
 //!     .with_rel_tol(1e-4)
-//!     .with_max_iterations(10);
+//!     .with_max_iterations(10)
+//!     .with_step_size_policy(bulirsch::StepSizePolicy::Linear);
 //!
 //! // Define initial conditions and provide solution storage.
-//! let t_final = 0.2;
+//! let t_final: f64 = 0.2;
 //! let y = ndarray::array![1.];
 //! let mut y_final = ndarray::Array::zeros([1]);
 //!
@@ -107,16 +108,23 @@ use ndarray as nd;
 use num_traits::cast;
 
 pub trait Float:
-    num_traits::Float + core::iter::Sum + core::ops::AddAssign
+    num_traits::Float
+    + core::iter::Sum
+    + core::ops::AddAssign
+    + core::ops::MulAssign
+    + core::fmt::Debug
 {
 }
 
 impl Float for f32 {}
 impl Float for f64 {}
 
+/// Trait for defining an ordinary differential equation system.
 pub trait System {
+    /// The floating point type.
     type Float: Float;
 
+    /// Evaluate the ordinary differential equation and store the derivative in `dydt`.
     fn system(
         &self,
         y: ArrayView1<Self::Float>,
@@ -153,6 +161,14 @@ pub struct FailedToConverge<F: Float> {
     pub stats: Stats<F>,
 }
 
+/// Possible step size policies
+pub enum StepSizePolicy {
+    /// Increase the substep size linearly with each subsequent iteration.
+    Linear,
+    /// Increase the substep size exponentially with each subsequent iteration.
+    Exponential,
+}
+
 /// An explicit ODE integrator using the Bulirsch-Stoer algorithm.
 pub struct Integrator<S: System> {
     /// The absolute tolerance.
@@ -160,6 +176,8 @@ pub struct Integrator<S: System> {
     /// The relative tolerance.
     rel_tol: S::Float,
 
+    /// The step size policy to use.
+    step_size_policy: StepSizePolicy,
     /// The maximum number of iterations to use.
     max_iterations: usize,
 }
@@ -172,6 +190,7 @@ where
         Self {
             abs_tol: cast(1e-5).unwrap(),
             rel_tol: cast(1e-5).unwrap(),
+            step_size_policy: StepSizePolicy::Linear,
             max_iterations: 20,
         }
     }
@@ -190,6 +209,16 @@ where
         Self { rel_tol, ..self }
     }
 
+    /// Set the step size policy.
+    pub fn with_step_size_policy(
+        self,
+        step_size_policy: StepSizePolicy,
+    ) -> Self {
+        Self {
+            step_size_policy,
+            ..self
+        }
+    }
     /// Set the maximum allowed number of iterations per step.
     pub fn with_max_iterations(self, max_iterations: usize) -> Self {
         Self {
@@ -258,12 +287,15 @@ where
     /// // Instantiate system and integrator.
     /// let system = TrigSystem { omega: 1.2 };
     /// let integrator =
-    ///     bulirsch::Integrator::default().with_abs_tol(1e-6).with_rel_tol(0.);
+    ///     bulirsch::Integrator::default()
+    ///         .with_abs_tol(1e-6)
+    ///         .with_rel_tol(0.)
+    ///         .with_step_size_policy(bulirsch::StepSizePolicy::Exponential);
     ///
     /// // Define initial conditions and integrate.
     /// let y = ndarray::array![1., 0.];
     /// let mut y_next = ndarray::Array1::zeros(y.raw_dim());
-    /// let t_final = 1.1;
+    /// let t_final = 0.6;
     /// let stats = integrator
     ///     .step(&system, t_final, y.view(), y_next.view_mut())
     ///     .unwrap();
@@ -306,7 +338,7 @@ where
     ///     1e-6,
     /// );
     /// let ode_solvers_stats = solver.integrate().unwrap();
-    /// assert_eq!(ode_solvers_stats.num_eval, 63);
+    /// assert_eq!(ode_solvers_stats.num_eval, 48);
     /// ```
     pub fn step(
         &self,
@@ -315,7 +347,7 @@ where
         y_init: nd::ArrayView1<S::Float>,
         mut y_final: nd::ArrayViewMut1<S::Float>,
     ) -> Result<Stats<S::Float>, FailedToConverge<S::Float>> {
-        let mut evaluation_counter = EvaluationCounter {
+        let mut evaluation_counter = SystemEvaluationCounter {
             system,
             num_system_evals: 0,
         };
@@ -327,23 +359,30 @@ where
         };
 
         // Step size policy.
-        let compute_n = |k: usize| -> usize { 2 * (k + 1) };
+        let compute_n = match self.step_size_policy {
+            StepSizePolicy::Linear => |k: usize| -> usize { 2 * (k + 1) },
+            StepSizePolicy::Exponential => {
+                |k: usize| -> usize { 2u32.pow((k + 1) as u32) as usize }
+            }
+        };
 
         // Build up integration tableau.
         let mut T = Vec::<Vec<nd::Array1<S::Float>>>::new();
         for k in 0..self.max_iterations {
-            let n = compute_n(k);
+            let nk = compute_n(k);
             let mut Tk = Vec::with_capacity(k + 1);
             Tk.push(self.midpoint_step(
                 &mut evaluation_counter,
                 delta_t,
-                n,
+                nk,
                 &f_init,
                 y_init,
             ));
             for j in 0..k {
+                // There is a mistake in eq. 17.3.8. See
+                // https://www.numerical.recipes/forumarchive/index.php/t-2256.html.
                 let denominator = <S::Float as num_traits::Float>::powi(
-                    cast::<_, S::Float>(n).unwrap()
+                    cast::<_, S::Float>(nk).unwrap()
                         / cast(compute_n(k - j - 1)).unwrap(),
                     2,
                 ) - <S::Float as num_traits::One>::one();
@@ -365,9 +404,9 @@ where
                     return Ok(Stats {
                         num_system_evals: evaluation_counter.num_system_evals,
                         num_iterations: k,
-                        num_midpoint_substeps: n,
+                        num_midpoint_substeps: nk,
                         midpoint_substep_size: delta_t
-                            / cast::<_, S::Float>(n).unwrap(),
+                            / cast::<_, S::Float>(nk).unwrap(),
                         scaled_truncation_error,
                     });
                 }
@@ -399,13 +438,14 @@ where
 
     fn midpoint_step(
         &self,
-        evaluation_counter: &mut EvaluationCounter<S>,
+        evaluation_counter: &mut SystemEvaluationCounter<S>,
         delta_t: S::Float,
         n: usize,
         f_init: &nd::Array1<S::Float>,
         y_init: nd::ArrayView1<S::Float>,
     ) -> nd::Array1<S::Float> {
         let substep_size = delta_t / cast(n).unwrap();
+        let two_substep_size = cast::<_, S::Float>(2).unwrap() * substep_size;
 
         // 0    1    2    3    4    5    6    n
         //                  ..
@@ -419,14 +459,19 @@ where
         let mut fi = f_init.clone();
 
         for _i in 1..n {
-            std::mem::swap(&mut zi, &mut zip1);
+            core::mem::swap(&mut zi, &mut zip1);
             evaluation_counter.system(zi.view(), fi.view_mut());
-            zip1 += &(&fi * cast::<_, S::Float>(2.).unwrap() * substep_size);
+            fi *= two_substep_size;
+            zip1 += &fi;
         }
 
         evaluation_counter.system(zip1.view(), fi.view_mut());
-        (&zi + &zip1 + fi * S::Float::from(substep_size))
-            * cast::<_, S::Float>(0.5).unwrap()
+        fi *= substep_size;
+        let mut result = zi;
+        result += &zip1;
+        result += &fi;
+        result *= cast::<_, S::Float>(0.5).unwrap();
+        result
     }
 }
 
@@ -447,12 +492,12 @@ fn compute_scaled_truncation_error<F: Float + core::iter::Sum>(
     .sqrt()
 }
 
-struct EvaluationCounter<'a, S: System> {
+struct SystemEvaluationCounter<'a, S: System> {
     system: &'a S,
     num_system_evals: usize,
 }
 
-impl<'a, S: System> EvaluationCounter<'a, S> {
+impl<'a, S: System> SystemEvaluationCounter<'a, S> {
     fn system(
         &mut self,
         y: nd::ArrayView1<S::Float>,
@@ -460,5 +505,58 @@ impl<'a, S: System> EvaluationCounter<'a, S> {
     ) {
         self.num_system_evals += 1;
         <S as System>::system(&self.system, y, dydt);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exp_system_high_precision() {
+        struct ExpSystem {}
+
+        impl System for ExpSystem {
+            type Float = f64;
+
+            fn system(
+                &self,
+                y: ArrayView1<Self::Float>,
+                mut dydt: ArrayViewMut1<Self::Float>,
+            ) {
+                dydt.assign(&y);
+            }
+        }
+
+        let system = ExpSystem {};
+
+        // Set up integrator with tolerance parameters.
+        let integrator = Integrator::<ExpSystem>::default()
+            .with_abs_tol(0.)
+            .with_rel_tol(1e-14);
+
+        // Define initial conditions and provide solution storage.
+        let t_final = 0.2;
+        let y = ndarray::array![1.];
+        let mut y_final = ndarray::Array::zeros([1]);
+
+        // Integrate.
+        let stats = integrator
+            .step(&system, t_final, y.view(), y_final.view_mut())
+            .unwrap();
+
+        // Ensure result matches analytic solution to high precision.
+        approx::assert_relative_eq!(
+            t_final.exp(),
+            y_final[[0]],
+            max_relative = 1e-14,
+        );
+
+        // Check integration performance.
+        assert_eq!(stats.num_system_evals, 43);
+        assert_eq!(stats.num_iterations, 5);
+        assert_eq!(stats.num_midpoint_substeps, 12);
+        approx::assert_relative_eq!(stats.midpoint_substep_size, t_final / 12.);
+        assert!(stats.scaled_truncation_error < 1.);
     }
 }
