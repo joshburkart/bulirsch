@@ -1,15 +1,16 @@
-//! Implementation of the Bulirsch-Stoer method for solving ordinary differential equations.
+//! Implementation of the Bulirsch-Stoer method for stepping ordinary differential equations.
 //!
 //! The [(Gragg-)Bulirsch-Stoer](https://en.wikipedia.org/wiki/Bulirsch%E2%80%93Stoer_algorithm)
-//! algorithm combines the midpoint method with Richardson extrapolation to accelerate convergence.
-//! It is an explicit method that does not require Jacobians.
+//! algorithm combines the (modified) midpoint method with Richardson extrapolation to accelerate
+//! convergence. It is an explicit method that does not require Jacobians.
 //!
 //! This crate's implementation, which follows ch. 17.3.2 of Numerical Recipes (Third Edition), does
 //! not contain adaptive step size routines. It can be useful in situations where an ODE is being
 //! integrated step by step with a prescribed step size that is not too large relative to the
 //! dynamical timescale, for example in simulations of electromechanical control systems with a
 //! fixed control cycle period. Each integration step is stateless, aside from the integration state
-//! vector which the caller must maintain.
+//! vector which the caller must maintain. Only time-independent ODEs are supported, but without
+//! loss of generality (since the state vector can be augmented with a time variable if needed).
 //!
 //! As an example, consider a simple exponential system:
 //!
@@ -31,7 +32,7 @@
 //!
 //! let system = ExpSystem {};
 //!
-//! // Set up integrator with tolerance parameters.
+//! // Set up the integrator.
 //! let integrator = bulirsch::Integrator::<ExpSystem>::default()
 //!     .with_abs_tol(1e-4)
 //!     .with_rel_tol(1e-4)
@@ -59,8 +60,8 @@
 //! // Check integration performance.
 //! assert_eq!(stats.num_system_evals, 7);
 //! assert_eq!(stats.num_iterations, 1);
-//! assert_eq!(stats.num_midpoint_substeps, 4);
-//! approx::assert_relative_eq!(stats.midpoint_substep_size, t_final / 4.);
+//! assert_eq!(stats.num_substeps, 4);
+//! approx::assert_relative_eq!(stats.substep_size, t_final / 4.);
 //! assert!(stats.scaled_truncation_error < 1.);
 //! ```
 //!
@@ -113,6 +114,7 @@ pub trait Float:
     + core::ops::AddAssign
     + core::ops::MulAssign
     + core::fmt::Debug
+    + nd::ScalarOperand
 {
 }
 
@@ -125,27 +127,22 @@ pub trait System {
     type Float: Float;
 
     /// Evaluate the ordinary differential equation and store the derivative in `dydt`.
-    fn system(
-        &self,
-        y: ArrayView1<Self::Float>,
-        dydt: ArrayViewMut1<Self::Float>,
-    );
+    fn system(&self, y: ArrayView1<Self::Float>, dydt: ArrayViewMut1<Self::Float>);
 }
 
 /// Statistics from taking an integration step.
 #[must_use]
 #[derive(Debug)]
 pub struct Stats<F: Float> {
-    /// The total number of ODE system evaluations used to achieve convergence.
+    /// The total number of ODE system evaluations used.
     pub num_system_evals: usize,
 
-    /// The number of iterations used when convergence was achieved.
+    /// The number of iterations used.
     pub num_iterations: usize,
-    /// The number of midpoint substeps used when convergence was achieved.
-    pub num_midpoint_substeps: usize,
-
-    /// The substep size when convergence was achieved.
-    pub midpoint_substep_size: F,
+    /// The number of substeps used on the final iteration.
+    pub num_substeps: usize,
+    /// The substep size on the final iteration.
+    pub substep_size: F,
 
     /// The scaled (including absolute and relative tolerances) truncation error.
     ///
@@ -161,12 +158,54 @@ pub struct FailedToConverge<F: Float> {
     pub stats: Stats<F>,
 }
 
-/// Possible step size policies
+/// Possible step size policies, which determine how the algorithm increases the number of substeps
+/// on every iteration.
+#[derive(Default)]
 pub enum StepSizePolicy {
-    /// Increase the substep size linearly with each subsequent iteration.
+    /// Increase the number of substeps linearly with each subsequent iteration.
+    ///
+    /// This is appropriate if the step size is already relatively small, and few substeps are
+    /// likely needed for convergence.
+    #[default]
     Linear,
-    /// Increase the substep size exponentially with each subsequent iteration.
+    /// Increase the number of substeps exponentially with each subsequent iteration.
+    ///
+    /// This is appropriate if the step size may be relatively large, so many substeps might be
+    /// required for convergence.
     Exponential,
+}
+
+/// Possible extrapolation policies, which determine how the algorithm extrapolates.
+///
+/// This affects how convergence is assessed, as well as how the integration result is produced.
+#[derive(Default)]
+pub enum ConvergencePolicy {
+    /// Use all previous iterations to extrapolate.
+    ///
+    /// This is appropriate for smooth system functions where the step size is relatively small.
+    #[default]
+    AllIterations,
+    /// Use only the last `num_iterations` to extrapolate.
+    ///
+    /// This is appropriate for larger step sizes, or if the system function is not smooth, so that
+    /// early iterations should be ignored when extrapolating. It can also be useful if NaNs or
+    /// infinities are produced when the substep size is too large (for early iterations), so that
+    /// they these non-finite numbers are eventually ignored.
+    Window {
+        /// The number of previous iterations' results to use for extrapolation.
+        num_iterations: core::num::NonZero<usize>,
+    },
+}
+
+impl ConvergencePolicy {
+    fn get_extrap_pair<'a, F: Float>(&self, Tk: &'a [nd::Array1<F>]) -> &'a [nd::Array1<F>] {
+        match self {
+            Self::AllIterations => Tk.last_chunk::<2>().unwrap(),
+            Self::Window { num_iterations } => Tk
+                .get(num_iterations.get()..num_iterations.get() + 2)
+                .unwrap_or_else(|| Tk.last_chunk::<2>().unwrap()),
+        }
+    }
 }
 
 /// An explicit ODE integrator using the Bulirsch-Stoer algorithm.
@@ -178,19 +217,22 @@ pub struct Integrator<S: System> {
 
     /// The step size policy to use.
     step_size_policy: StepSizePolicy,
+    /// The convergence policy to use.
+    convergence_policy: ConvergencePolicy,
     /// The maximum number of iterations to use.
     max_iterations: usize,
 }
 
 impl<S: System> Default for Integrator<S>
 where
-    S::Float: Float + nd::ScalarOperand,
+    S::Float: Float,
 {
     fn default() -> Self {
         Self {
             abs_tol: cast(1e-5).unwrap(),
             rel_tol: cast(1e-5).unwrap(),
-            step_size_policy: StepSizePolicy::Linear,
+            step_size_policy: StepSizePolicy::default(),
+            convergence_policy: ConvergencePolicy::default(),
             max_iterations: 20,
         }
     }
@@ -198,7 +240,7 @@ where
 
 impl<S: System> Integrator<S>
 where
-    S::Float: Float + nd::ScalarOperand,
+    S::Float: Float,
 {
     /// Set the absolute tolerance.
     pub fn with_abs_tol(self, abs_tol: S::Float) -> Self {
@@ -210,12 +252,16 @@ where
     }
 
     /// Set the step size policy.
-    pub fn with_step_size_policy(
-        self,
-        step_size_policy: StepSizePolicy,
-    ) -> Self {
+    pub fn with_step_size_policy(self, step_size_policy: StepSizePolicy) -> Self {
         Self {
             step_size_policy,
+            ..self
+        }
+    }
+    /// Set the convergence policy.
+    pub fn with_convergence_policy(self, convergence_policy: ConvergencePolicy) -> Self {
+        Self {
+            convergence_policy,
             ..self
         }
     }
@@ -371,42 +417,32 @@ where
         for k in 0..self.max_iterations {
             let nk = compute_n(k);
             let mut Tk = Vec::with_capacity(k + 1);
-            Tk.push(self.midpoint_step(
-                &mut evaluation_counter,
-                delta_t,
-                nk,
-                &f_init,
-                y_init,
-            ));
+            Tk.push(self.midpoint_step(&mut evaluation_counter, delta_t, nk, &f_init, y_init));
             for j in 0..k {
                 // There is a mistake in eq. 17.3.8. See
                 // https://www.numerical.recipes/forumarchive/index.php/t-2256.html.
                 let denominator = <S::Float as num_traits::Float>::powi(
-                    cast::<_, S::Float>(nk).unwrap()
-                        / cast(compute_n(k - j - 1)).unwrap(),
+                    cast::<_, S::Float>(nk).unwrap() / cast(compute_n(k - j - 1)).unwrap(),
                     2,
                 ) - <S::Float as num_traits::One>::one();
                 Tk.push(&Tk[j] + (&Tk[j] - &T[k - 1][j]) / denominator);
             }
 
             if k > 0 {
-                let last_two = Tk.last_chunk::<2>().unwrap();
+                let extrap_pair = self.convergence_policy.get_extrap_pair(&Tk);
                 let scaled_truncation_error = compute_scaled_truncation_error(
-                    last_two[0].view(),
-                    last_two[1].view(),
+                    extrap_pair[0].view(),
+                    extrap_pair[1].view(),
                     self.abs_tol,
                     self.rel_tol,
                 );
-                if scaled_truncation_error
-                    <= <S::Float as num_traits::One>::one()
-                {
-                    y_final.assign(&last_two[1]);
+                if scaled_truncation_error <= <S::Float as num_traits::One>::one() {
+                    y_final.assign(&extrap_pair[1]);
                     return Ok(Stats {
                         num_system_evals: evaluation_counter.num_system_evals,
                         num_iterations: k,
-                        num_midpoint_substeps: nk,
-                        midpoint_substep_size: delta_t
-                            / cast::<_, S::Float>(nk).unwrap(),
+                        num_substeps: nk,
+                        substep_size: delta_t / cast::<_, S::Float>(nk).unwrap(),
                         scaled_truncation_error,
                     });
                 }
@@ -416,10 +452,12 @@ where
         }
 
         // Failed to converge. Compute stats and return.
-        let last_two = T.last().unwrap().last_chunk::<2>().unwrap();
+        let last_Tk = T.last().unwrap();
+        let extrap_pair = self.convergence_policy.get_extrap_pair(last_Tk);
+        y_final.assign(&extrap_pair[1]);
         let scaled_truncation_error = compute_scaled_truncation_error(
-            last_two[0].view(),
-            last_two[1].view(),
+            extrap_pair[0].view(),
+            extrap_pair[1].view(),
             self.abs_tol,
             self.rel_tol,
         );
@@ -429,8 +467,8 @@ where
             stats: Stats {
                 num_system_evals: evaluation_counter.num_system_evals,
                 num_iterations: self.max_iterations,
-                num_midpoint_substeps: n,
-                midpoint_substep_size: delta_t / cast(n).unwrap(),
+                num_substeps: n,
+                substep_size: delta_t / cast(n).unwrap(),
                 scaled_truncation_error,
             },
         })
@@ -498,11 +536,7 @@ struct SystemEvaluationCounter<'a, S: System> {
 }
 
 impl<'a, S: System> SystemEvaluationCounter<'a, S> {
-    fn system(
-        &mut self,
-        y: nd::ArrayView1<S::Float>,
-        dydt: nd::ArrayViewMut1<S::Float>,
-    ) {
+    fn system(&mut self, y: nd::ArrayView1<S::Float>, dydt: nd::ArrayViewMut1<S::Float>) {
         self.num_system_evals += 1;
         <S as System>::system(&self.system, y, dydt);
     }
@@ -519,11 +553,7 @@ mod tests {
         impl System for ExpSystem {
             type Float = f64;
 
-            fn system(
-                &self,
-                y: ArrayView1<Self::Float>,
-                mut dydt: ArrayViewMut1<Self::Float>,
-            ) {
+            fn system(&self, y: ArrayView1<Self::Float>, mut dydt: ArrayViewMut1<Self::Float>) {
                 dydt.assign(&y);
             }
         }
@@ -546,17 +576,62 @@ mod tests {
             .unwrap();
 
         // Ensure result matches analytic solution to high precision.
-        approx::assert_relative_eq!(
-            t_final.exp(),
-            y_final[[0]],
-            max_relative = 1e-14,
-        );
+        approx::assert_relative_eq!(t_final.exp(), y_final[[0]], max_relative = 1e-14);
 
         // Check integration performance.
         assert_eq!(stats.num_system_evals, 43);
         assert_eq!(stats.num_iterations, 5);
-        assert_eq!(stats.num_midpoint_substeps, 12);
-        approx::assert_relative_eq!(stats.midpoint_substep_size, t_final / 12.);
+        assert_eq!(stats.num_substeps, 12);
+        approx::assert_relative_eq!(stats.substep_size, t_final / 12.);
         assert!(stats.scaled_truncation_error < 1.);
+    }
+
+    #[test]
+    fn exp_system_handle_nans() {
+        struct ExpSystem {
+            hit_a_nan: core::cell::RefCell<bool>,
+        }
+
+        impl System for ExpSystem {
+            type Float = f64;
+
+            fn system(&self, y: ArrayView1<Self::Float>, mut dydt: ArrayViewMut1<Self::Float>) {
+                if y[0].abs() > 10. {
+                    *self.hit_a_nan.borrow_mut() = true;
+                    dydt[0] = core::f64::NAN;
+                } else {
+                    dydt.assign(&(-&y));
+                }
+            }
+        }
+
+        let system = ExpSystem {
+            hit_a_nan: false.into(),
+        };
+
+        // Set up integrator with tolerance parameters.
+        let integrator = Integrator::<ExpSystem>::default()
+            .with_abs_tol(0.)
+            .with_rel_tol(1e-10)
+            .with_step_size_policy(StepSizePolicy::Exponential)
+            .with_convergence_policy(ConvergencePolicy::Window {
+                num_iterations: core::num::NonZero::new(3).unwrap(),
+            });
+
+        // Define initial conditions and provide solution storage.
+        let t_final = 5.;
+        let y = ndarray::array![1.];
+        let mut y_final = ndarray::Array::zeros([1]);
+
+        // Integrate.
+        let _stats = integrator
+            .step(&system, t_final, y.view(), y_final.view_mut())
+            .unwrap();
+
+        // Ensure result matches analytic solution.
+        approx::assert_relative_eq!((-t_final).exp(), y_final[[0]], max_relative = 1e-8);
+
+        // Ensure we hit at least one NaN.
+        assert!(*system.hit_a_nan.borrow());
     }
 }
