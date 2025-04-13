@@ -1,6 +1,6 @@
 [package]
 name = "bulirsch"
-version = "0.1.5"
+version = "0.1.6"
 authors = ["Josh Burkart"]
 edition = "2024"
 license = "MIT"
@@ -14,4 +14,4 @@ num-traits = { version = "0.2" }
 [dev-dependencies]
 approx = { version = "0.5" }
 nalgebra = { version = "0.33" }
-ode_solvers = { version = "0.6.1" }
+ode_solvers = { version = "0.5.0" }
