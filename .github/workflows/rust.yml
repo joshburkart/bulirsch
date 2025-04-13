@@ -11,12 +11,10 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
     steps:
     - uses: actions/checkout@v4
     - name: Run tests
       run: |
-        cargo test --verbose
+        cargo test
         cargo fmt --check
