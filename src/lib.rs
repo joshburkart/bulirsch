@@ -167,12 +167,13 @@ pub trait System {
 pub struct StepSizeUnderflow<F: Float>(F);
 
 /// Statistics from taking an integration step.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Stats {
     /// Number of system function evaluations.
     pub num_system_evals: usize,
 }
 
+#[derive(Clone)]
 pub struct AdaptiveStepSizeIntegrator<F: Float> {
     /// The underlying non-adaptive integrator.
     integrator: Integrator<F>,
@@ -423,6 +424,7 @@ impl<F: Float> AdaptiveStepSizeIntegrator<F> {
 }
 
 /// An ODE integrator using the Bulirsch-Stoer algorithm with a fixed step size.
+#[derive(Clone)]
 pub struct Integrator<F: Float> {
     /// The absolute tolerance.
     abs_tol: F,
