@@ -179,7 +179,7 @@ pub enum StepSizePolicy {
 ///
 /// This affects how convergence is assessed, as well as how the integration result is produced.
 #[derive(Default)]
-pub enum ConvergencePolicy {
+pub enum ExtrapolationPolicy {
     /// Use all previous iterations to extrapolate.
     ///
     /// This is appropriate for smooth system functions where the step size is relatively small.
@@ -190,14 +190,14 @@ pub enum ConvergencePolicy {
     /// This is appropriate for larger step sizes, or if the system function is not smooth, so that
     /// early iterations should be ignored when extrapolating. It can also be useful if NaNs or
     /// infinities are produced when the substep size is too large (for early iterations), so that
-    /// they these non-finite numbers are eventually ignored.
+    /// these non-finite numbers can eventually be ignored.
     Window {
         /// The number of previous iterations' results to use for extrapolation.
         num_iterations: core::num::NonZero<usize>,
     },
 }
 
-impl ConvergencePolicy {
+impl ExtrapolationPolicy {
     fn get_extrap_pair<'a, F: Float>(&self, Tk: &'a [nd::Array1<F>]) -> &'a [nd::Array1<F>] {
         match self {
             Self::AllIterations => Tk.last_chunk::<2>().unwrap(),
@@ -217,8 +217,8 @@ pub struct Integrator<S: System> {
 
     /// The step size policy to use.
     step_size_policy: StepSizePolicy,
-    /// The convergence policy to use.
-    convergence_policy: ConvergencePolicy,
+    /// The extrapolation policy to use.
+    extrapolation_policy: ExtrapolationPolicy,
     /// The maximum number of iterations to use.
     max_iterations: usize,
 }
@@ -232,7 +232,7 @@ where
             abs_tol: cast(1e-5).unwrap(),
             rel_tol: cast(1e-5).unwrap(),
             step_size_policy: StepSizePolicy::default(),
-            convergence_policy: ConvergencePolicy::default(),
+            extrapolation_policy: ExtrapolationPolicy::default(),
             max_iterations: 20,
         }
     }
@@ -258,10 +258,10 @@ where
             ..self
         }
     }
-    /// Set the convergence policy.
-    pub fn with_convergence_policy(self, convergence_policy: ConvergencePolicy) -> Self {
+    /// Set the extrapolation policy.
+    pub fn with_extrapolation_policy(self, extrapolation_policy: ExtrapolationPolicy) -> Self {
         Self {
-            convergence_policy,
+            extrapolation_policy,
             ..self
         }
     }
@@ -429,7 +429,7 @@ where
             }
 
             if k > 0 {
-                let extrap_pair = self.convergence_policy.get_extrap_pair(&Tk);
+                let extrap_pair = self.extrapolation_policy.get_extrap_pair(&Tk);
                 let scaled_truncation_error = compute_scaled_truncation_error(
                     extrap_pair[0].view(),
                     extrap_pair[1].view(),
@@ -453,7 +453,7 @@ where
 
         // Failed to converge. Compute stats and return.
         let last_Tk = T.last().unwrap();
-        let extrap_pair = self.convergence_policy.get_extrap_pair(last_Tk);
+        let extrap_pair = self.extrapolation_policy.get_extrap_pair(last_Tk);
         y_final.assign(&extrap_pair[1]);
         let scaled_truncation_error = compute_scaled_truncation_error(
             extrap_pair[0].view(),
@@ -614,7 +614,7 @@ mod tests {
             .with_abs_tol(0.)
             .with_rel_tol(1e-10)
             .with_step_size_policy(StepSizePolicy::Exponential)
-            .with_convergence_policy(ConvergencePolicy::Window {
+            .with_extrapolation_policy(ExtrapolationPolicy::Window {
                 num_iterations: core::num::NonZero::new(3).unwrap(),
             });
 
