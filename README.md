@@ -1,3 +1,8 @@
+# Bulirsch-Stoer Method in Rust
+
+[![Crates.io](https://img.shields.io/crates/v/bulirsch.svg)](https://crates.io/crates/bulirsch)
+[![Docs](https://docs.rs/bulirsch/badge.svg)](https://docs.rs/bulirsch)
+
 Implementation of the Bulirsch-Stoer method for stepping ordinary differential equations.
 
 The [(Gragg-)Bulirsch-Stoer](https://en.wikipedia.org/wiki/Bulirsch%E2%80%93Stoer_algorithm)
