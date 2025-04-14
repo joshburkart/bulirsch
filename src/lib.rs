@@ -4,7 +4,7 @@
 //! algorithm combines the (modified) midpoint method with Richardson extrapolation to accelerate
 //! convergence. It is an explicit method that does not require Jacobians.
 //!
-//! This crate's implementation contains a simplistic adaptive step size routine without order
+//! This crate's implementation contains simplistic adaptive step size routines with order
 //! estimation. Its API is designed to be useful in situations where an ODE is being integrated step
 //! by step with a prescribed time step, for example in simulations of electromechanical control
 //! systems with a fixed control cycle period. Only time-independent ODEs are supported, but without
@@ -39,16 +39,11 @@
 //!
 //! let system = TrigSystem { omega: 1.2 };
 //!
-//! // Set up the integrator. In a future version, we hope to automatically estimate the target
-//! // number of iterations online, but for now it has to be set manually, and should be tuned to
-//! // minimize the number of function evaluations for a given system. Here using 7 target
-//! // iterations instead of the default of 3 decreases the number of function evaluations by ~35%
-//! // (see below).
+//! // Set up the integrator.
 //! let mut integrator = bulirsch::Integrator::default()
 //!     .with_abs_tol(1e-8)
 //!     .with_rel_tol(1e-8)
-//!     .into_adaptive()
-//!     .with_target_num_iterations(7);
+//!     .into_adaptive();
 //!
 //! // Define initial conditions and provide solution storage.
 //! let delta_t: f64 = 10.2;
@@ -73,11 +68,11 @@
 //! );
 //!
 //! // Check integration performance.
-//! assert_eq!(integrator.overall_stats().num_system_evals, 3862);
-//! approx::assert_relative_eq!(integrator.step_size().unwrap(), 2.74, epsilon = 1e-2);
+//! assert_eq!(integrator.overall_stats().num_system_evals, 3724);
+//! approx::assert_relative_eq!(integrator.step_size().unwrap(), 2.56, epsilon = 1e-2);
 //! ```
 //!
-//! Note that 3.9k system evaluations have been used. By contrast, the `ode_solvers::Dopri5`
+//! Note that 3.7k system evaluations have been used. By contrast, the `ode_solvers::Dopri5`
 //! algorithm uses more:
 //!
 //! ```
@@ -138,7 +133,6 @@
 pub use nd::ArrayView1;
 pub use nd::ArrayViewMut1;
 use ndarray as nd;
-use num_traits::cast;
 
 pub trait Float:
     num_traits::Float
@@ -181,13 +175,14 @@ pub struct AdaptiveStepSizeIntegrator<F: Float> {
     /// The current step size.
     step_size: Option<F>,
     /// The minimum step size to allow before returning [`StepSizeUnderflow`].
-    minimum_step_size: F,
+    min_step_size: F,
 
-    /// The target number of iterations to use. Ideally this would be estimated using order control,
-    /// but is instead an input parameter for simplicity.
-    target_num_iterations: usize,
+    /// The current estimated target number of iterations to use.
+    target_order: usize,
+    /// The maximum number of iterations to use.
+    max_order: usize,
 
-    /// Overall stats
+    /// Overall stats.
     overall_stats: Stats,
 }
 
@@ -256,8 +251,7 @@ impl<F: Float> AdaptiveStepSizeIntegrator<F> {
     ///     bulirsch::Integrator::default()
     ///         .with_abs_tol(1e-6)
     ///         .with_rel_tol(0.)
-    ///         .into_adaptive()
-    ///         .with_target_num_iterations(3);
+    ///         .into_adaptive();
     ///
     /// // Define initial conditions and integrate.
     /// let mut y = ndarray::array![1., 0.];
@@ -310,50 +304,47 @@ impl<F: Float> AdaptiveStepSizeIntegrator<F> {
         let mut y_after_step = y_init.to_owned();
         let mut t = F::zero();
         loop {
-            if step_size < self.minimum_step_size || !step_size.is_finite() {
+            if step_size < self.min_step_size || !step_size.is_finite() {
                 return Err(StepSizeUnderflow(step_size));
             }
 
-            // `next_t` is `None` if we're at the tail end of `delta_t` and are taking a smaller
-            // step than is optimal so we don't overshoot.
+            // We set `next_t` to `None` if we're at the tail end of `delta_t` and are taking a
+            // smaller step than is optimal so we don't overshoot.
             let next_t = if t < delta_t - step_size {
                 Some((t + step_size).min(delta_t))
             } else {
                 None
             };
+            step_size = step_size.min(delta_t - t);
 
             let step_result = self.integrator.step(
                 &mut system,
-                step_size.min(delta_t - t),
+                step_size,
+                self.target_order,
                 y_before_step.view(),
                 y_after_step.view_mut(),
             );
 
-            let adjustment_factor = match &step_result {
-                Ok(stats) | Err(stats) => {
-                    let scaled_truncation_error = *stats
-                        .scaled_truncation_errors
-                        .get(self.target_num_iterations)
-                        .unwrap();
-                    self.compute_step_size_adjustment_factor(scaled_truncation_error)
-                }
-            };
-            match (step_result.is_ok(), next_t) {
-                // The step was successful, and we're at the end of `delta_t`. Done. Don't adjust
-                // the step size since we took a smaller step than was possible, so our truncation
-                // error is not useful for step size adjustment.
+            match (step_result.converged(), next_t) {
+                // The step was successful, and we're at the end of `delta_t`. Done.
                 (true, None) => {
+                    let adjustment_factor =
+                        Self::compute_step_size_adjustment_factor(&step_result, self.target_order);
+                    step_size *= adjustment_factor;
                     break;
                 }
-                // The step was successful, and we're not at the end of `delta_t`. Adjust step size
-                // and continue.
+                // The step was successful, and we're not at the end of `delta_t`. Potentially
+                // adjust `target_order`, adjust step size, and continue.
                 (true, Some(next_t)) => {
+                    self.perform_order_and_step_size_control(&step_result, &mut step_size);
                     t = next_t;
-                    step_size *= adjustment_factor;
                     y_before_step.assign(&y_after_step);
                 }
-                // The step failed. Adjust step size and try again.
+                // The step failed. Adjust step size, but for simplicity, unlike Numerical Recipes,
+                // don't try to adjust order. Try again.
                 (false, _) => {
+                    let adjustment_factor =
+                        Self::compute_step_size_adjustment_factor(&step_result, self.target_order);
                     step_size *= adjustment_factor;
                 }
             }
@@ -368,29 +359,16 @@ impl<F: Float> AdaptiveStepSizeIntegrator<F> {
         })
     }
 
-    /// Set the target number of iterations.
-    ///
-    /// A step size will be continuously attempted to be produced so that convergence is achieved at
-    /// this number of iterations. Ideally this would be estimated automatically to minimize
-    /// computational cost, but it is instead currently an input parameter for simplicity.
-    pub fn with_target_num_iterations(self, target_num_iterations: usize) -> Self {
-        assert!(target_num_iterations < self.integrator.max_iterations);
+    /// Set the minimum step size to allow before returning [`StepSizeUnderflow`].
+    pub fn with_min_step_size(self, min_step_size: F) -> Self {
         Self {
-            target_num_iterations,
-            integrator: Integrator {
-                min_iterations: target_num_iterations,
-                ..self.integrator
-            },
+            min_step_size,
             ..self
         }
     }
-
-    /// Set the minimum step size to allow before returning [`StepSizeUnderflow`].
-    pub fn with_minimum_step_size(self, minimum_step_size: F) -> Self {
-        Self {
-            minimum_step_size,
-            ..self
-        }
+    /// Set the maximum order (or number of iterations per extrapolation) to use.
+    pub fn with_max_order(self, max_order: usize) -> Self {
+        Self { max_order, ..self }
     }
 
     /// Get the overall stats across all steps taken so far.
@@ -401,24 +379,75 @@ impl<F: Float> AdaptiveStepSizeIntegrator<F> {
     pub fn step_size(&self) -> Option<F> {
         self.step_size
     }
+    /// Get the current target order.
+    pub fn target_order(&self) -> usize {
+        self.target_order
+    }
 
-    fn compute_step_size_adjustment_factor(&self, scaled_truncation_error: F) -> F {
-        let safety_factor: F = cast(0.95).unwrap();
-        let min_step_size_decrease_factor: F = cast(0.01).unwrap();
+    fn compute_step_size_adjustment_factor(
+        step_result: &ExtrapolationResult<F>,
+        target_order: usize,
+    ) -> F {
+        let scaled_truncation_error = *step_result
+            .scaled_truncation_errors
+            .get(target_order)
+            .unwrap();
+
+        let safety_factor: F = cast(0.9);
+        let min_step_size_decrease_factor: F = cast(0.01);
         let max_step_size_increase_factor = min_step_size_decrease_factor.recip();
 
         if scaled_truncation_error > F::zero() {
-            // Eq. 2.14, Deuflhard, Peter. "Order and stepsize control in
-            // extrapolation methods." Numerische Mathematik 41 (1983): 399-422.
-            (safety_factor
-                / scaled_truncation_error
-                    .powf(F::one() / cast(2 * self.target_num_iterations + 1).unwrap()))
-            .max(min_step_size_decrease_factor)
-            .min(max_step_size_increase_factor)
-        } else if scaled_truncation_error.is_finite() {
-            F::one()
+            // Eq. 2.14, Deuflhard.
+            (safety_factor / scaled_truncation_error.powf(F::one() / cast(2 * target_order + 1)))
+                .max(min_step_size_decrease_factor)
+                .min(max_step_size_increase_factor)
+        } else if scaled_truncation_error == F::zero() {
+            cast(2)
         } else {
-            cast(0.5).unwrap()
+            // Handle NaNs.
+            cast(0.5)
+        }
+    }
+
+    fn perform_order_and_step_size_control(
+        &mut self,
+        step_result: &ExtrapolationResult<F>,
+        step_size: &mut F,
+    ) {
+        let adjustment_factor =
+            Self::compute_step_size_adjustment_factor(&step_result, self.target_order);
+
+        // This follows eqs. 17.3.14 & 17.3.15 in Numerical Recipes.
+        if self.target_order > 0 {
+            let adjustment_factor_lower_order =
+                Self::compute_step_size_adjustment_factor(&step_result, self.target_order - 1);
+
+            let work = cast::<_, F>(compute_work(self.target_order));
+            let work_per_step = work / *step_size / adjustment_factor;
+            let work_lower_order = cast::<_, F>(compute_work(self.target_order - 1));
+            let work_per_step_lower_order =
+                work_lower_order / *step_size / adjustment_factor_lower_order;
+
+            self.target_order = if work_per_step_lower_order < cast::<_, F>(0.8) * work_per_step
+                && self.target_order > 1
+            {
+                *step_size *= adjustment_factor_lower_order;
+                self.target_order - 1
+            // We use 0.98 instead of 0.9 from Numerical Recipes since it produced better
+            // performance on the tests.
+            } else if work_per_step < cast::<_, F>(0.98) * work_per_step_lower_order
+                && self.target_order + 1 <= self.max_order
+            {
+                let work_higher_order = cast::<_, F>(compute_work(self.target_order + 1));
+                *step_size *= adjustment_factor * work_higher_order / work;
+                self.target_order + 1
+            } else {
+                *step_size *= adjustment_factor;
+                self.target_order
+            };
+        } else {
+            *step_size *= adjustment_factor;
         }
     }
 }
@@ -430,20 +459,13 @@ pub struct Integrator<F: Float> {
     abs_tol: F,
     /// The relative tolerance.
     rel_tol: F,
-
-    /// The minimum number of iterations to use.
-    min_iterations: usize,
-    /// The maximum number of iterations to use.
-    max_iterations: usize,
 }
 
 impl<F: Float> Default for Integrator<F> {
     fn default() -> Self {
         Self {
-            abs_tol: cast(1e-5).unwrap(),
-            rel_tol: cast(1e-5).unwrap(),
-            min_iterations: 2,
-            max_iterations: 10,
+            abs_tol: cast(1e-5),
+            rel_tol: cast(1e-5),
         }
     }
 }
@@ -451,15 +473,12 @@ impl<F: Float> Default for Integrator<F> {
 impl<F: Float> Integrator<F> {
     /// Make an [`AdaptiveStepSizeIntegrator`].
     pub fn into_adaptive(self) -> AdaptiveStepSizeIntegrator<F> {
-        let target_num_iterations = 3;
         AdaptiveStepSizeIntegrator {
-            integrator: Self {
-                min_iterations: target_num_iterations,
-                ..self
-            },
+            integrator: self,
             step_size: None,
-            minimum_step_size: cast(1e-6).unwrap(),
-            target_num_iterations,
+            min_step_size: cast(1e-6),
+            target_order: 3,
+            max_order: 10,
             overall_stats: Stats {
                 num_system_evals: 0,
             },
@@ -475,34 +494,24 @@ impl<F: Float> Integrator<F> {
         Self { rel_tol, ..self }
     }
 
-    /// Set the maximum allowed number of iterations per step.
-    pub fn with_max_iterations(self, max_iterations: usize) -> Self {
-        Self {
-            max_iterations,
-            ..self
-        }
-    }
-
     /// Take a single extrapolating step, iteratively subdividing in order to extrapolate.
     fn step<S: System<Float = F>>(
         &self,
         system: &mut SystemEvaluationCounter<S>,
         step_size: F,
+        order: usize,
         y_init: nd::ArrayView1<F>,
         mut y_final: nd::ArrayViewMut1<F>,
-    ) -> Result<ExtrapolationStats<F>, ExtrapolationStats<F>> {
+    ) -> ExtrapolationResult<F> {
         let f_init = {
             let mut f_init = nd::Array1::zeros(y_init.raw_dim());
             system.system(y_init, f_init.view_mut());
             f_init
         };
 
-        // Step size policy.
-        let compute_n = |k: usize| -> usize { 2 * (k + 1) };
-
         // Build up an extrapolation tableau.
         let mut tableau = ExtrapolationTableau(Vec::<ExtrapolationTableauRow<_>>::new());
-        for k in 0..self.max_iterations {
+        for k in 0..=order + 1 {
             let nk = compute_n(k);
             let tableau_row = {
                 let mut Tk = Vec::with_capacity(k + 1);
@@ -511,7 +520,7 @@ impl<F: Float> Integrator<F> {
                     // There is a mistake in eq. 17.3.8. See
                     // https://www.numerical.recipes/forumarchive/index.php/t-2256.html.
                     let denominator = <F as num_traits::Float>::powi(
-                        cast::<_, F>(nk).unwrap() / cast(compute_n(k - j - 1)).unwrap(),
+                        cast::<_, F>(nk) / cast(compute_n(k - j - 1)),
                         2,
                     ) - <F as num_traits::One>::one();
                     Tk.push(&Tk[j] + (&Tk[j] - &tableau.0[k - 1].0[j]) / denominator);
@@ -519,30 +528,13 @@ impl<F: Float> Integrator<F> {
                 ExtrapolationTableauRow(Tk)
             };
             tableau.0.push(tableau_row);
-
-            if k > 0 {
-                let scaled_truncation_error = tableau
-                    .0
-                    .last()
-                    .unwrap()
-                    .compute_scaled_truncation_error(self.abs_tol, self.rel_tol);
-                if k > self.min_iterations
-                    && scaled_truncation_error <= <F as num_traits::One>::one()
-                {
-                    y_final.assign(&tableau.0.last().unwrap().estimate());
-                    return Ok(ExtrapolationStats {
-                        scaled_truncation_errors: tableau
-                            .compute_scaled_truncation_errors(self.abs_tol, self.rel_tol),
-                    });
-                }
-            }
         }
 
-        // Failed to converge.
-        Err(ExtrapolationStats {
+        y_final.assign(&tableau.0.last().unwrap().estimate());
+        return ExtrapolationResult {
             scaled_truncation_errors: tableau
                 .compute_scaled_truncation_errors(self.abs_tol, self.rel_tol),
-        })
+        };
     }
 
     fn midpoint_step<S: System<Float = F>>(
@@ -553,8 +545,8 @@ impl<F: Float> Integrator<F> {
         f_init: &nd::Array1<F>,
         y_init: nd::ArrayView1<F>,
     ) -> nd::Array1<F> {
-        let substep_size = step_size / cast(n).unwrap();
-        let two_substep_size = cast::<_, F>(2).unwrap() * substep_size;
+        let substep_size = step_size / cast(n);
+        let two_substep_size = cast::<_, F>(2) * substep_size;
 
         // 0    1    2    3    4    5    6    n
         //                  ..
@@ -579,19 +571,25 @@ impl<F: Float> Integrator<F> {
         let mut result = zi;
         result += &zip1;
         result += &fi;
-        result *= cast::<_, F>(0.5).unwrap();
+        result *= cast::<_, F>(0.5);
         result
     }
 }
 
 /// Statistics from taking an integration step.
 #[derive(Debug)]
-struct ExtrapolationStats<F: Float> {
+struct ExtrapolationResult<F: Float> {
     /// The scaled (including absolute and relative tolerances) truncation errors for each
     /// iteration.
     ///
     /// Each will be <= 1 if convergence was achieved or > 1 if convergence was not achieved.
     scaled_truncation_errors: Vec<F>,
+}
+
+impl<F: Float> ExtrapolationResult<F> {
+    fn converged(&self) -> bool {
+        *self.scaled_truncation_errors.last().unwrap() < F::one()
+    }
 }
 
 struct SystemEvaluationCounter<'a, S: System> {
@@ -632,7 +630,7 @@ impl<F: Float> ExtrapolationTableauRow<F> {
                 (yi - yi_alt).powi(2) / scale.powi(2)
             })
             .sum::<F>()
-            / cast(y.len()).unwrap())
+            / cast(y.len()))
         .sqrt()
     }
 
@@ -641,30 +639,59 @@ impl<F: Float> ExtrapolationTableauRow<F> {
     }
 }
 
+/// Step size policy.
+///
+/// We use a simple linear policy based on the results in Deuflhard.
+fn compute_n(iteration: usize) -> usize {
+    2 * (iteration + 1)
+}
+
+/// Cumulative sum of `compute_n`.
+///
+/// The amount of system function evaluations required to extrapolate to a given order.
+fn compute_work(iteration: usize) -> usize {
+    2 * (iteration + 1) + 2 * iteration * (iteration + 1) / 2
+}
+
+fn cast<T: num_traits::NumCast, F: Float>(num: T) -> F {
+    num_traits::cast(num).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Test that the computation of "work" (i.e. number of system evaluations) is correct.
     #[test]
-    fn exp_system_high_precision() {
-        struct ExpSystem {}
-
-        impl System for ExpSystem {
-            type Float = f64;
-
-            fn system(&self, y: ArrayView1<Self::Float>, mut dydt: ArrayViewMut1<Self::Float>) {
-                dydt.assign(&y);
-            }
+    fn test_compute_work() {
+        for iteration in 0..5 {
+            assert_eq!(
+                compute_work(iteration),
+                (0..=iteration).map(compute_n).sum()
+            );
         }
+    }
 
+    struct ExpSystem {}
+
+    impl System for ExpSystem {
+        type Float = f64;
+
+        fn system(&self, y: ArrayView1<Self::Float>, mut dydt: ArrayViewMut1<Self::Float>) {
+            dydt.assign(&y);
+        }
+    }
+
+    /// Ensure we can solve an exponential system to high precision.
+    #[test]
+    fn test_exp_system_high_precision() {
         let system = ExpSystem {};
 
         // Set up integrator with tolerance parameters.
         let mut integrator = Integrator::default()
             .with_abs_tol(0.)
             .with_rel_tol(1e-14)
-            .into_adaptive()
-            .with_target_num_iterations(4);
+            .into_adaptive();
 
         // Define initial conditions and provide solution storage.
         let t_final = 3.5;
@@ -680,17 +707,44 @@ mod tests {
         approx::assert_relative_eq!(t_final.exp(), y_final[[0]], max_relative = 5e-13);
 
         // Check integration performance.
-        assert_eq!(stats.num_system_evals, 541);
-        approx::assert_relative_eq!(integrator.step_size().unwrap(), 0.385, epsilon = 1e-3);
+        assert_eq!(stats.num_system_evals, 437);
+        approx::assert_relative_eq!(integrator.step_size().unwrap(), 0.28, epsilon = 1e-2);
     }
 
+    /// Ensure the algorithm works even when the max order is smaller than optimal.
     #[test]
-    fn exp_system_handle_nans() {
-        struct ExpSystem {
+    fn test_exp_system_low_max_order() {
+        let system = ExpSystem {};
+
+        // Set up integrator with tolerance parameters.
+        let mut integrator = Integrator::default()
+            .with_abs_tol(0.)
+            .with_rel_tol(1e-14)
+            .into_adaptive()
+            .with_max_order(1);
+
+        // Define initial conditions and provide solution storage.
+        let t_final = 3.5;
+        let y = ndarray::array![1.];
+        let mut y_final = ndarray::Array::zeros([1]);
+
+        // Integrate.
+        integrator
+            .step(&system, t_final, y.view(), y_final.view_mut())
+            .unwrap();
+
+        // Ensure result matches analytic solution to high precision.
+        approx::assert_relative_eq!(t_final.exp(), y_final[[0]], max_relative = 5e-13);
+    }
+
+    /// Ensure the algorithm can handle NaNs.
+    #[test]
+    fn test_exp_system_handle_nans() {
+        struct ExpSystemWithNans {
             hit_a_nan: core::cell::RefCell<bool>,
         }
 
-        impl System for ExpSystem {
+        impl System for ExpSystemWithNans {
             type Float = f64;
 
             fn system(&self, y: ArrayView1<Self::Float>, mut dydt: ArrayViewMut1<Self::Float>) {
@@ -703,7 +757,7 @@ mod tests {
             }
         }
 
-        let system = ExpSystem {
+        let system = ExpSystemWithNans {
             hit_a_nan: false.into(),
         };
 
@@ -711,8 +765,7 @@ mod tests {
         let mut integrator = Integrator::default()
             .with_abs_tol(0.)
             .with_rel_tol(1e-10)
-            .into_adaptive()
-            .with_target_num_iterations(4);
+            .into_adaptive();
 
         // Define initial conditions and provide solution storage.
         let t_final = 20.;
@@ -730,6 +783,42 @@ mod tests {
         // Ensure we hit at least one NaN.
         assert!(*system.hit_a_nan.borrow());
 
-        assert_eq!(stats.num_system_evals, 1404);
+        assert_eq!(stats.num_system_evals, 1134);
+    }
+
+    /// This is for interactive debugging as it has no asserts.
+    #[test]
+    fn test_varying_timescale() {
+        struct SharpPendulumSystem {}
+
+        impl System for SharpPendulumSystem {
+            type Float = f64;
+
+            fn system(&self, y: ArrayView1<Self::Float>, mut dydt: ArrayViewMut1<Self::Float>) {
+                dydt[[0]] = y[[1]];
+                dydt[[1]] = -30. * y[[0]].sin().powi(31);
+            }
+        }
+
+        let system = SharpPendulumSystem {};
+
+        let mut integrator = Integrator::default().into_adaptive();
+
+        let delta_t = 10.;
+        let num_steps = 100;
+        let mut y = ndarray::array![1., 0.];
+        let mut y_final = ndarray::Array::zeros(y.raw_dim());
+
+        for _ in 0..num_steps {
+            integrator
+                .step(&system, delta_t, y.view(), y_final.view_mut())
+                .unwrap();
+            y.assign(&y_final);
+            println!(
+                "order: {} step_size: {} y: {y}",
+                integrator.target_order(),
+                integrator.step_size().unwrap()
+            );
+        }
     }
 }
