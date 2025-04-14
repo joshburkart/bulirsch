@@ -6,9 +6,10 @@
 //!
 //! This crate's implementation contains simplistic adaptive step size routines with order
 //! estimation. Its API is designed to be useful in situations where an ODE is being integrated step
-//! by step with a prescribed time step, for example in simulations of electromechanical control
-//! systems with a fixed control cycle period. Only time-independent ODEs are supported, but without
-//! loss of generality (since the state vector can be augmented with a time variable if needed).
+//! by step with a prescribed time step, for example in integrated simulations of electromechanical
+//! control systems with a fixed control cycle period. Only time-independent ODEs are supported, but
+//! without loss of generality (since the state vector can be augmented with a time variable if
+//! needed).
 //!
 //! The implementation follows:
 //! * Press, William H. Numerical Recipes 3rd Edition: The Art of Scientific Computing. Cambridge
@@ -20,11 +21,11 @@
 //!
 //! ```
 //! // Define ODE.
-//! struct TrigSystem {
+//! struct OscillatorSystem {
 //!     omega: f64,
 //! }
 //!
-//! impl bulirsch::System for TrigSystem {
+//! impl bulirsch::System for OscillatorSystem {
 //!     type Float = f64;
 //!
 //!     fn system(
@@ -37,7 +38,7 @@
 //!     }
 //! }
 //!
-//! let system = TrigSystem { omega: 1.2 };
+//! let system = OscillatorSystem { omega: 1.2 };
 //!
 //! // Set up the integrator.
 //! let mut integrator = bulirsch::Integrator::default()
@@ -68,19 +69,19 @@
 //! );
 //!
 //! // Check integration performance.
-//! assert_eq!(integrator.overall_stats().num_system_evals, 3724);
-//! approx::assert_relative_eq!(integrator.step_size().unwrap(), 2.56, epsilon = 1e-2);
+//! assert_eq!(integrator.overall_stats().num_system_evals, 3843);
+//! approx::assert_relative_eq!(integrator.step_size().unwrap(), 2.14, epsilon = 1e-2);
 //! ```
 //!
 //! Note that 3.7k system evaluations have been used. By contrast, the `ode_solvers::Dopri5`
 //! algorithm uses more:
 //!
 //! ```
-//! struct TrigSystem {
+//! struct OscillatorSystem {
 //!     omega: f64,
 //! }
 //!
-//! impl ode_solvers::System<f64, ode_solvers::SVector<f64, 2>> for TrigSystem {
+//! impl ode_solvers::System<f64, ode_solvers::SVector<f64, 2>> for OscillatorSystem {
 //!     fn system(
 //!         &self,
 //!         _x: f64,
@@ -98,7 +99,7 @@
 //! let mut y = ode_solvers::Vector2::new(1., 0.);
 //! let num_steps = 10;
 //! for _ in 0..num_steps {
-//!     let system = TrigSystem { omega };
+//!     let system = OscillatorSystem { omega };
 //!     let mut solver = ode_solvers::Dopri5::new(
 //!         system,
 //!         0.,
@@ -156,7 +157,8 @@ pub trait System {
     fn system(&self, y: ArrayView1<Self::Float>, dydt: ArrayViewMut1<Self::Float>);
 }
 
-/// Error produced when integration produced a step size smaller than the minimum allowed step size.
+/// Error generated when integration produced a step size smaller than the minimum allowed step
+/// size.
 #[derive(Debug)]
 pub struct StepSizeUnderflow<F: Float>(F);
 
@@ -212,7 +214,7 @@ impl<F: Float> AdaptiveStepSizeIntegrator<F> {
     /// ```
     /// // Define trigonometric ODE.
     /// #[derive(Clone, Copy)]
-    /// struct TrigSystem {
+    /// struct OscillatorSystem {
     ///     omega: f32,
     /// }
     ///
@@ -225,7 +227,7 @@ impl<F: Float> AdaptiveStepSizeIntegrator<F> {
     ///     dydt[1] = -omega.powi(2) * y[0];
     /// }
     ///
-    /// impl bulirsch::System for TrigSystem {
+    /// impl bulirsch::System for OscillatorSystem {
     ///     type Float = f32;
     ///
     ///     fn system(
@@ -246,7 +248,7 @@ impl<F: Float> AdaptiveStepSizeIntegrator<F> {
     /// }
     ///
     /// // Instantiate system and integrator.
-    /// let system = TrigSystem { omega: 1.2 };
+    /// let system = OscillatorSystem { omega: 1.2 };
     /// let mut integrator =
     ///     bulirsch::Integrator::default()
     ///         .with_abs_tol(1e-6)
@@ -317,7 +319,7 @@ impl<F: Float> AdaptiveStepSizeIntegrator<F> {
             };
             step_size = step_size.min(delta_t - t);
 
-            let step_result = self.integrator.step(
+            let extrapolation_result = self.integrator.extrapolate(
                 &mut system,
                 step_size,
                 self.target_order,
@@ -325,27 +327,23 @@ impl<F: Float> AdaptiveStepSizeIntegrator<F> {
                 y_after_step.view_mut(),
             );
 
-            match (step_result.converged(), next_t) {
+            match (extrapolation_result.converged(), next_t) {
                 // The step was successful, and we're at the end of `delta_t`. Done.
                 (true, None) => {
-                    let adjustment_factor =
-                        Self::compute_step_size_adjustment_factor(&step_result, self.target_order);
-                    step_size *= adjustment_factor;
+                    self.perform_step_size_control(&extrapolation_result, &mut step_size);
                     break;
                 }
                 // The step was successful, and we're not at the end of `delta_t`. Potentially
                 // adjust `target_order`, adjust step size, and continue.
                 (true, Some(next_t)) => {
-                    self.perform_order_and_step_size_control(&step_result, &mut step_size);
+                    self.perform_order_and_step_size_control(&extrapolation_result, &mut step_size);
                     t = next_t;
                     y_before_step.assign(&y_after_step);
                 }
                 // The step failed. Adjust step size, but for simplicity, unlike Numerical Recipes,
                 // don't try to adjust order. Try again.
                 (false, _) => {
-                    let adjustment_factor =
-                        Self::compute_step_size_adjustment_factor(&step_result, self.target_order);
-                    step_size *= adjustment_factor;
+                    self.perform_step_size_control(&extrapolation_result, &mut step_size);
                 }
             }
         }
@@ -366,7 +364,7 @@ impl<F: Float> AdaptiveStepSizeIntegrator<F> {
             ..self
         }
     }
-    /// Set the maximum order (or number of iterations per extrapolation) to use.
+    /// Set the maximum "order" to use, i.e. max number of iterations per extrapolation.
     pub fn with_max_order(self, max_order: usize) -> Self {
         Self { max_order, ..self }
     }
@@ -385,10 +383,10 @@ impl<F: Float> AdaptiveStepSizeIntegrator<F> {
     }
 
     fn compute_step_size_adjustment_factor(
-        step_result: &ExtrapolationResult<F>,
+        extrapolation_result: &ExtrapolationResult<F>,
         target_order: usize,
     ) -> F {
-        let scaled_truncation_error = *step_result
+        let scaled_truncation_error = *extrapolation_result
             .scaled_truncation_errors
             .get(target_order)
             .unwrap();
@@ -410,18 +408,30 @@ impl<F: Float> AdaptiveStepSizeIntegrator<F> {
         }
     }
 
-    fn perform_order_and_step_size_control(
-        &mut self,
-        step_result: &ExtrapolationResult<F>,
+    fn perform_step_size_control(
+        &self,
+        extrapolation_result: &ExtrapolationResult<F>,
         step_size: &mut F,
     ) {
         let adjustment_factor =
-            Self::compute_step_size_adjustment_factor(&step_result, self.target_order);
+            Self::compute_step_size_adjustment_factor(&extrapolation_result, self.target_order);
+        *step_size *= adjustment_factor;
+    }
+
+    fn perform_order_and_step_size_control(
+        &mut self,
+        extrapolation_result: &ExtrapolationResult<F>,
+        step_size: &mut F,
+    ) {
+        let adjustment_factor =
+            Self::compute_step_size_adjustment_factor(&extrapolation_result, self.target_order);
 
         // This follows eqs. 17.3.14 & 17.3.15 in Numerical Recipes.
         if self.target_order > 0 {
-            let adjustment_factor_lower_order =
-                Self::compute_step_size_adjustment_factor(&step_result, self.target_order - 1);
+            let adjustment_factor_lower_order = Self::compute_step_size_adjustment_factor(
+                &extrapolation_result,
+                self.target_order - 1,
+            );
 
             let work = cast::<_, F>(compute_work(self.target_order));
             let work_per_step = work / *step_size / adjustment_factor;
@@ -432,17 +442,21 @@ impl<F: Float> AdaptiveStepSizeIntegrator<F> {
             self.target_order = if work_per_step_lower_order < cast::<_, F>(0.8) * work_per_step
                 && self.target_order > 1
             {
+                // Decrease order since a lower order requires less work.
                 *step_size *= adjustment_factor_lower_order;
                 self.target_order - 1
-            // We use 0.98 instead of 0.9 from Numerical Recipes since it produced better
-            // performance on the tests.
-            } else if work_per_step < cast::<_, F>(0.98) * work_per_step_lower_order
+            } else if work_per_step < cast::<_, F>(0.95) * work_per_step_lower_order
                 && self.target_order + 1 <= self.max_order
             {
+                // Increase order since a higher order is heuristically indicated to require less
+                // work (even though we didn't extrapolate to this order, so can't tell for sure).
+                // We use 0.95 above instead of 0.9 from Numerical Recipes since it produced better
+                // performance on the tests.
                 let work_higher_order = cast::<_, F>(compute_work(self.target_order + 1));
                 *step_size *= adjustment_factor * work_higher_order / work;
                 self.target_order + 1
             } else {
+                // Preserve order and only adjust step size.
                 *step_size *= adjustment_factor;
                 self.target_order
             };
@@ -476,7 +490,7 @@ impl<F: Float> Integrator<F> {
         AdaptiveStepSizeIntegrator {
             integrator: self,
             step_size: None,
-            min_step_size: cast(1e-6),
+            min_step_size: cast(1e-9),
             target_order: 3,
             max_order: 10,
             overall_stats: Stats {
@@ -495,7 +509,7 @@ impl<F: Float> Integrator<F> {
     }
 
     /// Take a single extrapolating step, iteratively subdividing in order to extrapolate.
-    fn step<S: System<Float = F>>(
+    fn extrapolate<S: System<Float = F>>(
         &self,
         system: &mut SystemEvaluationCounter<S>,
         step_size: F,
@@ -783,7 +797,7 @@ mod tests {
         // Ensure we hit at least one NaN.
         assert!(*system.hit_a_nan.borrow());
 
-        assert_eq!(stats.num_system_evals, 1134);
+        assert_eq!(stats.num_system_evals, 1085);
     }
 
     /// This is for interactive debugging as it has no asserts.
