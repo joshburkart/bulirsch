@@ -1,6 +1,6 @@
 [package]
 name = "bulirsch"
-version = "0.1.9"
+version = "0.1.10"
 authors = ["Josh Burkart"]
 edition = "2024"
 license = "MIT"

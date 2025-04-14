@@ -17,4 +17,5 @@ jobs:
     - name: Run tests
       run: |
         cargo test
+        cargo doc
         cargo fmt --check

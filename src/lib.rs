@@ -17,7 +17,7 @@
 //! * Deuflhard, Peter. "Order and stepsize control in extrapolation methods." Numerische Mathematik
 //!   41 (1983): 399-422.
 //!
-//! As an example, consider a simple trigonometric system:
+//! As an example, consider a simple oscillator system:
 //!
 //! ```
 //! // Define ODE.
@@ -169,8 +169,12 @@ pub struct Stats {
     pub num_system_evals: usize,
 }
 
+/// An ODE integrator using the Bulirsch-Stoer algorithm with an adaptive step size and adaptive
+/// order.
+///
+/// Should be constructed using [`Integrator::into_adaptive`].
 #[derive(Clone)]
-pub struct AdaptiveStepSizeIntegrator<F: Float> {
+pub struct AdaptiveIntegrator<F: Float> {
     /// The underlying non-adaptive integrator.
     integrator: Integrator<F>,
 
@@ -188,7 +192,7 @@ pub struct AdaptiveStepSizeIntegrator<F: Float> {
     overall_stats: Stats,
 }
 
-impl<F: Float> AdaptiveStepSizeIntegrator<F> {
+impl<F: Float> AdaptiveIntegrator<F> {
     /// Take a step using the Bulirsch-Stoer method.
     ///
     /// # Arguments
@@ -206,13 +210,13 @@ impl<F: Float> AdaptiveStepSizeIntegrator<F> {
     ///
     /// # Examples
     ///
-    /// Note that if you're using e.g. [`nalgebra`] to define your ODE, you can bridge to
-    /// [`ndarray`] vectors using slices, as long as you're using [`nalgebra`]'s dynamically sized
-    /// vectors. The same applies to using [`Vec`]s, etc. For example, consider a simple
-    /// trigonometric system defined using [`nalgebra`]:
+    /// Note that if you're using e.g. `nalgebra` to define your ODE, you can bridge to [`ndarray`]
+    /// vectors using slices, as long as you're using `nalgebra`'s dynamically sized vectors. The
+    /// same applies to using [`Vec`]s, etc. For example, consider a simple oscillator system
+    /// defined using `nalgebra`:
     ///
     /// ```
-    /// // Define trigonometric ODE.
+    /// // Define oscillator ODE.
     /// #[derive(Clone, Copy)]
     /// struct OscillatorSystem {
     ///     omega: f32,
@@ -369,7 +373,7 @@ impl<F: Float> AdaptiveStepSizeIntegrator<F> {
         Self { max_order, ..self }
     }
 
-    /// Get the overall stats across all steps taken so far.
+    /// Get overall stats across all steps taken so far.
     pub fn overall_stats(&self) -> &Stats {
         &self.overall_stats
     }
@@ -467,6 +471,8 @@ impl<F: Float> AdaptiveStepSizeIntegrator<F> {
 }
 
 /// An ODE integrator using the Bulirsch-Stoer algorithm with a fixed step size.
+///
+/// Used to construct an [`AdaptiveIntegrator`].
 #[derive(Clone)]
 pub struct Integrator<F: Float> {
     /// The absolute tolerance.
@@ -478,16 +484,16 @@ pub struct Integrator<F: Float> {
 impl<F: Float> Default for Integrator<F> {
     fn default() -> Self {
         Self {
-            abs_tol: cast(1e-5),
-            rel_tol: cast(1e-5),
+            abs_tol: cast(1e-6),
+            rel_tol: cast(1e-6),
         }
     }
 }
 
 impl<F: Float> Integrator<F> {
-    /// Make an [`AdaptiveStepSizeIntegrator`].
-    pub fn into_adaptive(self) -> AdaptiveStepSizeIntegrator<F> {
-        AdaptiveStepSizeIntegrator {
+    /// Make an [`AdaptiveIntegrator`].
+    pub fn into_adaptive(self) -> AdaptiveIntegrator<F> {
+        AdaptiveIntegrator {
             integrator: self,
             step_size: None,
             min_step_size: cast(1e-9),
@@ -508,7 +514,7 @@ impl<F: Float> Integrator<F> {
         Self { rel_tol, ..self }
     }
 
-    /// Take a single extrapolating step, iteratively subdividing in order to extrapolate.
+    /// Take a single extrapolating step, iteratively subdividing `step_size`.
     fn extrapolate<S: System<Float = F>>(
         &self,
         system: &mut SystemEvaluationCounter<S>,
@@ -531,7 +537,7 @@ impl<F: Float> Integrator<F> {
                 let mut Tk = Vec::with_capacity(k + 1);
                 Tk.push(self.midpoint_step(system, step_size, nk, &f_init, y_init));
                 for j in 0..k {
-                    // There is a mistake in eq. 17.3.8. See
+                    // There is a mistake in Numerical Recipes eq. 17.3.8. See
                     // https://www.numerical.recipes/forumarchive/index.php/t-2256.html.
                     let denominator = <F as num_traits::Float>::powi(
                         cast::<_, F>(nk) / cast(compute_n(k - j - 1)),
