@@ -182,6 +182,8 @@ pub struct AdaptiveIntegrator<F: Float> {
     step_size: Option<F>,
     /// The minimum step size to allow before returning [`StepSizeUnderflow`].
     min_step_size: F,
+    /// The maximum step size to allow.
+    max_step_size: Option<F>,
 
     /// The current estimated target number of iterations to use.
     target_order: usize,
@@ -368,6 +370,13 @@ impl<F: Float> AdaptiveIntegrator<F> {
             ..self
         }
     }
+    /// Set the minimum step size to allow before returning [`StepSizeUnderflow`].
+    pub fn with_max_step_size(self, max_step_size: Option<F>) -> Self {
+        Self {
+            max_step_size,
+            ..self
+        }
+    }
     /// Set the maximum "order" to use, i.e. max number of iterations per extrapolation.
     pub fn with_max_order(self, max_order: usize) -> Self {
         Self { max_order, ..self }
@@ -420,6 +429,10 @@ impl<F: Float> AdaptiveIntegrator<F> {
         let adjustment_factor =
             Self::compute_step_size_adjustment_factor(&extrapolation_result, self.target_order);
         *step_size *= adjustment_factor;
+
+        if let Some(max_step_size) = self.max_step_size {
+            *step_size = step_size.min(max_step_size);
+        }
     }
 
     fn perform_order_and_step_size_control(
@@ -467,6 +480,10 @@ impl<F: Float> AdaptiveIntegrator<F> {
         } else {
             *step_size *= adjustment_factor;
         }
+
+        if let Some(max_step_size) = self.max_step_size {
+            *step_size = step_size.min(max_step_size);
+        }
     }
 }
 
@@ -497,6 +514,7 @@ impl<F: Float> Integrator<F> {
             integrator: self,
             step_size: None,
             min_step_size: cast(1e-9),
+            max_step_size: None,
             target_order: 3,
             max_order: 10,
             overall_stats: Stats {
