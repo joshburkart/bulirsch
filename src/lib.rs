@@ -337,6 +337,10 @@ impl<F: Float> AdaptiveIntegrator<F> {
                 // The step was successful, and we're at the end of `delta_t`. Done.
                 (true, None) => {
                     self.perform_step_size_control(&extrapolation_result, &mut step_size);
+                    // Do not over-shrink step size as a result of successful
+                    // integration, or we'll pre-emptively panic on the next
+                    // integration call.
+                    step_size = step_size.max(self.min_step_size);
                     break;
                 }
                 // The step was successful, and we're not at the end of `delta_t`. Potentially
@@ -858,5 +862,42 @@ mod tests {
                 integrator.step_size().unwrap()
             );
         }
+    }
+
+    /// Ensure we don't adapt timesteps out of the limits.
+    #[test]
+    fn test_step_size_limits() {
+        let system = ExpSystem {};
+
+        // Set up integrator with tolerance parameters.
+        let mut integrator = Integrator::default().into_adaptive();
+
+        // Define initial conditions and provide solution storage.
+        let y = ndarray::array![1.];
+        let mut y_final = ndarray::Array::zeros([1]);
+
+        // Ask the integrator to step forward a tiny fraction above the step size.
+        integrator.step_size = Some(0.02);
+        integrator.max_step_size = Some(0.04);
+        integrator.min_step_size = 1E-3;
+        let t_final = 0.02 + 1E-4;
+        integrator
+            .step(&system, t_final, y.view(), y_final.view_mut())
+            .unwrap();
+
+        // Check that the step size we adapted to is still within the integrator limits.
+        // (We likely are at the minimum)
+        let step_size = integrator.step_size().unwrap();
+        println!("Step size: {step_size}");
+        assert!(integrator.min_step_size <= step_size);
+        assert!(step_size <= integrator.max_step_size.unwrap());
+
+        // Step the integrator again.
+        integrator
+            .step(&system, t_final, y.view(), y_final.view_mut())
+            .unwrap();
+        // Since our first step was tiny, adaptation should grow our step size.
+        println!("Step size: {}", integrator.step_size().unwrap());
+        assert!(integrator.step_size().unwrap() > step_size);
     }
 }
