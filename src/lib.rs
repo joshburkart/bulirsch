@@ -337,10 +337,12 @@ impl<F: Float> AdaptiveIntegrator<F> {
                 // The step was successful, and we're at the end of `delta_t`. Done.
                 (true, None) => {
                     self.perform_step_size_control(&extrapolation_result, &mut step_size);
-                    // Do not over-shrink step size as a result of successful
-                    // integration, or we'll pre-emptively panic on the next
-                    // integration call.
-                    step_size = step_size.max(self.min_step_size);
+                    // Do not shrink step size by more than half as a result of
+                    // successful integration, or we may pre-emptively panic on
+                    // the next integration call.
+                    step_size = self.step_size.map_or(step_size, |current| {
+                        step_size.max(cast::<_, F>(0.5) * current)
+                    });
                     break;
                 }
                 // The step was successful, and we're not at the end of `delta_t`. Potentially
@@ -886,7 +888,6 @@ mod tests {
             .unwrap();
 
         // Check that the step size we adapted to is still within the integrator limits.
-        // (We likely are at the minimum)
         let step_size = integrator.step_size().unwrap();
         println!("Step size: {step_size}");
         assert!(integrator.min_step_size <= step_size);
