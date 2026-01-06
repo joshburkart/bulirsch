@@ -338,7 +338,6 @@ impl<F: Float> AdaptiveIntegrator<F> {
                     // shouldn't modify step size.
                     if step_size >= cast::<_, F>(self.step_size.unwrap()) {
                         self.perform_step_size_control(&extrapolation_result, &mut step_size);
-                        self.step_size = Some(step_size);
                     }
                     break;
                 }
@@ -348,13 +347,11 @@ impl<F: Float> AdaptiveIntegrator<F> {
                     self.perform_order_and_step_size_control(&extrapolation_result, &mut step_size);
                     t = next_t;
                     y_before_step.assign(&y_after_step);
-                    self.step_size = Some(step_size);
                 }
                 // The step failed. Adjust step size, but for simplicity, unlike Numerical Recipes,
                 // don't try to adjust order. Try again.
                 (false, _) => {
                     self.perform_step_size_control(&extrapolation_result, &mut step_size);
-                    self.step_size = Some(step_size);
                 }
             }
         }
@@ -426,7 +423,7 @@ impl<F: Float> AdaptiveIntegrator<F> {
     }
 
     fn perform_step_size_control(
-        &self,
+        &mut self,
         extrapolation_result: &ExtrapolationResult<F>,
         step_size: &mut F,
     ) {
@@ -437,6 +434,7 @@ impl<F: Float> AdaptiveIntegrator<F> {
         if let Some(max_step_size) = self.max_step_size {
             *step_size = step_size.min(max_step_size);
         }
+        self.step_size = Some(*step_size);
     }
 
     fn perform_order_and_step_size_control(
@@ -488,6 +486,7 @@ impl<F: Float> AdaptiveIntegrator<F> {
         if let Some(max_step_size) = self.max_step_size {
             *step_size = step_size.min(max_step_size);
         }
+        self.step_size = Some(*step_size);
     }
 }
 
