@@ -69,8 +69,8 @@
 //! );
 //!
 //! // Check integration performance.
-//! assert_eq!(integrator.overall_stats().num_system_evals, 3843);
-//! approx::assert_relative_eq!(integrator.step_size().unwrap(), 2.14, epsilon = 1e-2);
+//! assert_eq!(integrator.overall_stats().num_system_evals, 3770);
+//! approx::assert_relative_eq!(integrator.step_size().unwrap(), 2.10, epsilon = 1e-2);
 //! ```
 //!
 //! Note that 3.7k system evaluations have been used. By contrast, the `ode_solvers::Dopri5`
@@ -294,11 +294,7 @@ impl<F: Float> AdaptiveIntegrator<F> {
         y_init: nd::ArrayView1<S::Float>,
         mut y_final: nd::ArrayViewMut1<S::Float>,
     ) -> Result<Stats, StepSizeUnderflow<F>> {
-        let mut step_size = if let Some(step_size) = self.step_size {
-            step_size
-        } else {
-            delta_t
-        };
+        let mut step_size = *self.step_size.get_or_insert(delta_t);
 
         let mut system = SystemEvaluationCounter {
             system,
@@ -336,7 +332,13 @@ impl<F: Float> AdaptiveIntegrator<F> {
             match (extrapolation_result.converged(), next_t) {
                 // The step was successful, and we're at the end of `delta_t`. Done.
                 (true, None) => {
-                    self.perform_step_size_control(&extrapolation_result, &mut step_size);
+                    // If the local step size is smaller than the internally
+                    // tracked step size, then we are taking an intentionally
+                    // shorter step to "finish off" integrating the interval and
+                    // shouldn't modify step size.
+                    if step_size >= cast::<_, F>(self.step_size.unwrap()) {
+                        self.perform_step_size_control(&extrapolation_result, &mut step_size);
+                    }
                     break;
                 }
                 // The step was successful, and we're not at the end of `delta_t`. Potentially
@@ -354,7 +356,6 @@ impl<F: Float> AdaptiveIntegrator<F> {
             }
         }
 
-        self.step_size = Some(step_size);
         y_final.assign(&y_after_step);
         self.overall_stats.num_system_evals += system.num_system_evals;
 
@@ -422,7 +423,7 @@ impl<F: Float> AdaptiveIntegrator<F> {
     }
 
     fn perform_step_size_control(
-        &self,
+        &mut self,
         extrapolation_result: &ExtrapolationResult<F>,
         step_size: &mut F,
     ) {
@@ -433,6 +434,7 @@ impl<F: Float> AdaptiveIntegrator<F> {
         if let Some(max_step_size) = self.max_step_size {
             *step_size = step_size.min(max_step_size);
         }
+        self.step_size = Some(*step_size);
     }
 
     fn perform_order_and_step_size_control(
@@ -484,6 +486,7 @@ impl<F: Float> AdaptiveIntegrator<F> {
         if let Some(max_step_size) = self.max_step_size {
             *step_size = step_size.min(max_step_size);
         }
+        self.step_size = Some(*step_size);
     }
 }
 
@@ -746,7 +749,7 @@ mod tests {
 
         // Check integration performance.
         assert_eq!(stats.num_system_evals, 437);
-        approx::assert_relative_eq!(integrator.step_size().unwrap(), 0.28, epsilon = 1e-2);
+        approx::assert_relative_eq!(integrator.step_size().unwrap(), 1.84, epsilon = 1e-2);
     }
 
     /// Ensure the algorithm works even when the max order is smaller than optimal.
@@ -858,5 +861,41 @@ mod tests {
                 integrator.step_size().unwrap()
             );
         }
+    }
+
+    /// Ensure we don't adapt timesteps out of the limits.
+    #[test]
+    fn test_step_size_limits() {
+        let system = ExpSystem {};
+
+        // Set up integrator with tolerance parameters.
+        let mut integrator = Integrator::default().into_adaptive();
+
+        // Define initial conditions and provide solution storage.
+        let y = ndarray::array![1.];
+        let mut y_final = ndarray::Array::zeros([1]);
+
+        // Ask the integrator to step forward a tiny fraction above the step size.
+        integrator.step_size = Some(0.02);
+        integrator.max_step_size = Some(0.04);
+        integrator.min_step_size = 1E-3;
+        let t_final = 0.02 + 1E-4;
+        integrator
+            .step(&system, t_final, y.view(), y_final.view_mut())
+            .unwrap();
+
+        // Check that the step size we adapted to is still within the integrator limits.
+        let step_size = integrator.step_size().unwrap();
+        println!("Step size: {step_size}");
+        assert!(integrator.min_step_size <= step_size);
+        assert!(step_size <= integrator.max_step_size.unwrap());
+
+        // Step the integrator again.
+        integrator
+            .step(&system, t_final, y.view(), y_final.view_mut())
+            .unwrap();
+        // Since our first step was tiny, adaptation is allowed to grow our step size.
+        println!("Step size: {}", integrator.step_size().unwrap());
+        assert!(integrator.step_size().unwrap() >= step_size);
     }
 }
