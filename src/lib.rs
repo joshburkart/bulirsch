@@ -69,8 +69,8 @@
 //! );
 //!
 //! // Check integration performance.
-//! assert_eq!(integrator.overall_stats().num_system_evals, 3843);
-//! approx::assert_relative_eq!(integrator.step_size().unwrap(), 2.14, epsilon = 1e-2);
+//! assert_eq!(integrator.overall_stats().num_system_evals, 3770);
+//! approx::assert_relative_eq!(integrator.step_size().unwrap(), 2.10, epsilon = 1e-2);
 //! ```
 //!
 //! Note that 3.7k system evaluations have been used. By contrast, the `ode_solvers::Dopri5`
@@ -294,11 +294,7 @@ impl<F: Float> AdaptiveIntegrator<F> {
         y_init: nd::ArrayView1<S::Float>,
         mut y_final: nd::ArrayViewMut1<S::Float>,
     ) -> Result<Stats, StepSizeUnderflow<F>> {
-        let mut step_size = if let Some(step_size) = self.step_size {
-            step_size
-        } else {
-            delta_t
-        };
+        let mut step_size = *self.step_size.get_or_insert(delta_t);
 
         let mut system = SystemEvaluationCounter {
             system,
@@ -336,14 +332,14 @@ impl<F: Float> AdaptiveIntegrator<F> {
             match (extrapolation_result.converged(), next_t) {
                 // The step was successful, and we're at the end of `delta_t`. Done.
                 (true, None) => {
-                    self.perform_step_size_control(&extrapolation_result, &mut step_size);
-                    // Do not shrink step size by more than half as a result of
-                    // successful integration, or we may pre-emptively panic on
-                    // the next integration call.
-                    step_size = self.step_size.map_or(step_size, |current| {
-                        step_size.max(cast::<_, F>(0.5) * current)
-                    });
-                    self.step_size = Some(step_size);
+                    // If the local step size is smaller than the internally
+                    // tracked step size, then we are taking an intentionally
+                    // shorter step to "finish off" integrating the interval and
+                    // shouldn't modify step size.
+                    if step_size >= cast::<_, F>(self.step_size.unwrap()) {
+                        self.perform_step_size_control(&extrapolation_result, &mut step_size);
+                        self.step_size = Some(step_size);
+                    }
                     break;
                 }
                 // The step was successful, and we're not at the end of `delta_t`. Potentially
@@ -754,7 +750,7 @@ mod tests {
 
         // Check integration performance.
         assert_eq!(stats.num_system_evals, 437);
-        approx::assert_relative_eq!(integrator.step_size().unwrap(), 0.92, epsilon = 1e-2);
+        approx::assert_relative_eq!(integrator.step_size().unwrap(), 1.84, epsilon = 1e-2);
     }
 
     /// Ensure the algorithm works even when the max order is smaller than optimal.
